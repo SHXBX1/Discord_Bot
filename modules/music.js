@@ -1,4 +1,4 @@
-// ระบบเพลง: /music /setconsole /play /pause /resume /skip /stop /leave /queue /clearqueue /nowplaying /loop /shuffle /volume /remove /favorite /history /autoplay + ปุ่มควบคุม
+// ระบบเพลง: /music /setconsole /play /pause /resume /skip /stop /leave /queue /clearqueue /nowplaying /loop /shuffle /volume /remove /favorite /history /autoplay /247 + ปุ่มควบคุม
 // ดึงเสียงด้วย yt-dlp → แปลงด้วย ffmpeg → ส่งเข้าห้องเสียงด้วย @discordjs/voice
 // ต้องติดตั้ง yt-dlp บนเครื่องที่รันบอท (ดู README) | ตัวแปรใน .env: YTDLP_PATH, YTDLP_JS_RUNTIME, YTDLP_COOKIES, YTDLP_COOKIES_FROM_BROWSER
 import { execFile, spawn } from 'node:child_process';
@@ -45,6 +45,9 @@ const HOURGLASS = '\u231B\uFE0E'; // ⌛︎
 const PLAYLIST_LIMIT = 50;
 const IDLE_LEAVE_MS = 3 * 60_000; // คิวหมดแล้วอยู่ต่ออีก 3 นาทีก่อนออก
 const ALONE_LEAVE_MS = 60_000; // ไม่มีคนอยู่ในห้อง 1 นาทีแล้วออก
+const RETRY_247_MS = 30_000; // โหมด 24/7: หาเพลงมาต่อไม่ได้ รอแล้วลองใหม่ (ถ้าพลาดซ้ำจะรอนานขึ้นทีละ 30 วิ สูงสุด 5 นาที)
+const RETRY_247_MAX_MS = 5 * 60_000;
+const FAIL_STREAK_247 = 5; // เล่นไม่ได้ติดกันกี่เพลงถึงจะพักก่อน
 const ALLOWED_HOSTS = ['youtube.com', 'youtu.be', 'soundcloud.com', 'bandcamp.com'];
 // แนวเพลงในเมนูของคอนโซล: อยากเพิ่ม/แก้ ก็แก้รายการนี้ได้เลย (key ห้ามซ้ำ, สูงสุด 24 แนว)
 // queries = คำค้นหาบน YouTube (สุ่มใช้ทีละคำ) เพลงที่ยาวเกิน 10 นาทีหรือสั้นกว่า 1 นาทีจะถูกข้าม (กันเจอคลิปมิกซ์ยาวเป็นชั่วโมง)
@@ -129,6 +132,20 @@ export const commands = [
       .setName('autoplay')
       .setDescription('เปิด/ปิดเล่นเพลงที่คล้ายกันต่ออัตโนมัติเมื่อคิวหมด')
       .addStringOption((o) => o.setName('mode').setDescription('ไม่เลือก = สลับสถานะ').addChoices({ name: 'เปิด', value: 'on' }, { name: 'ปิด', value: 'off' })),
+  ),
+  voiceOnly(
+    new SlashCommandBuilder()
+      .setName('247')
+      .setDescription('โหมด 24/7 ให้บอทอยู่ในห้องเสียงและเล่นเพลงต่อเนื่องตลอดทั้งวัน')
+      .setDefaultMemberPermissions(P.ManageGuild)
+      .addStringOption((o) => o.setName('mode').setDescription('ไม่เลือก = สลับสถานะ').addChoices({ name: 'เปิด', value: 'on' }, { name: 'ปิด', value: 'off' }))
+      .addChannelOption((o) => o.setName('channel').setDescription('ห้องเสียงที่ให้บอทประจำ (ไม่เลือก = ห้องที่คุณอยู่)').addChannelTypes(ChannelType.GuildVoice))
+      .addStringOption((o) =>
+        o
+          .setName('genre')
+          .setDescription('แนวเพลงที่จะเล่นเรื่อยๆ (ไม่เลือก = สุ่มแนวเมื่อคิวหมด)')
+          .addChoices(...GENRES.map((x) => ({ name: x.label, value: x.key }))),
+      ),
   ),
 ];
 
@@ -333,8 +350,20 @@ function setAutoplay(guild, on) {
   save();
   const g = states.get(guild.id);
   if (g) {
+    const wasOn = g.autoplay;
     g.autoplay = on;
+    if (wasOn && !on) g.queue = []; // ปิด Auto = พร้อมเปิดเพลงเองแล้ว ล้างคิวที่ค้างอยู่ให้ (เพลงที่กำลังเล่นยังเล่นต่อ)
     refreshCard(g);
+  }
+}
+
+// ปิดโหมดเล่นตามแนว (และจำไว้สำหรับ 24/7 ว่าไม่มีแนวที่ตั้งไว้แล้ว)
+function stopGenreMode(g) {
+  g.genre = null;
+  const home = g.stay247 && db.music247?.[g.guildId];
+  if (home) {
+    home.genre = null;
+    save();
   }
 }
 
@@ -454,6 +483,8 @@ function createState(guild, vc, textChannel) {
     startedAt: 0,
     idleTimer: null,
     aloneTimer: null,
+    stay247: db.music247?.[guild.id]?.channelId === vc.id, // โหมด 24/7: ไม่ออกจากห้องเอง
+    fails: 0, // จำนวนเพลงที่เล่นไม่ได้ติดกัน (ใช้กับโหมด 24/7)
   };
 
   connection.subscribe(player);
@@ -466,10 +497,16 @@ function createState(guild, vc, textChannel) {
         entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
       ]);
     } catch {
+      const keep = g.stay247 && states.get(g.guildId) === g;
       destroyState(g);
+      if (keep) schedule247(g.guild); // โหมด 24/7: หลุด/โดนเตะ = เข้าห้องใหม่ให้เอง
     }
   });
-  connection.on(VoiceConnectionStatus.Destroyed, () => destroyState(g));
+  connection.on(VoiceConnectionStatus.Destroyed, () => {
+    const keep = g.stay247 && states.get(g.guildId) === g;
+    destroyState(g);
+    if (keep) schedule247(g.guild);
+  });
 
   player.on(AudioPlayerStatus.Idle, () => onIdle(g));
   player.on('error', (err) => {
@@ -483,6 +520,111 @@ function createState(guild, vc, textChannel) {
 
   states.set(guild.id, g);
   return g;
+}
+
+// ---------- โหมด 24/7 ----------
+// เปิดด้วย /247: บอทประจำห้องเสียงห้องเดียว ไม่ออกเองแม้คิวหมดหรือไม่มีคนอยู่ เล่นเพลงเรื่อยๆ ทั้งวัน
+// เก็บค่าไว้ใน db.music247[guildId] = { channelId, textChannelId, genre } เปิดบอทใหม่แล้วจะกลับเข้าห้องและเล่นต่อให้เอง
+const rejoinTimers = new Map(); // guildId -> timer เข้าห้องใหม่
+
+// คิวหมดในโหมด 24/7 แล้วไม่มีแนว/autoplay: ใช้แนวที่ตั้งไว้ ถ้าไม่มีก็สุ่มแนวจากรายการ GENRES
+async function refill247(g) {
+  if (!g.genre) {
+    const savedKey = db.music247?.[g.guildId]?.genre;
+    const genre = GENRES.find((x) => x.key === savedKey) ?? GENRES[Math.floor(Math.random() * GENRES.length)];
+    g.genre = { ...genre, by: g.guild.members.me?.id ?? g.guild.client.user.id };
+    g.genreSeen = new Set();
+  }
+  return refillGenre(g);
+}
+
+function disable247(guildId) {
+  if (db.music247?.[guildId]) {
+    delete db.music247[guildId];
+    save();
+  }
+  clearTimeout(rejoinTimers.get(guildId));
+  rejoinTimers.delete(guildId);
+  const g = states.get(guildId);
+  if (g) g.stay247 = false;
+}
+
+// สั่งให้บอทออกเอง (/stop /leave และปุ่ม) = ปิดโหมด 24/7 ด้วย ไม่งั้นบอทจะเข้ามาใหม่ คืน true ถ้าปิด 24/7 ไปด้วย
+function leaveByUser(g) {
+  const was247 = !!g.stay247;
+  if (was247) disable247(g.guildId);
+  destroyState(g);
+  return was247;
+}
+
+// เข้าห้อง 24/7 ที่ตั้งไว้แล้วเริ่มเล่น คืน true = เสร็จ/ไม่ต้องลองอีก, false = ลองใหม่ทีหลัง
+async function join247(guild) {
+  const cfg = db.music247?.[guild.id];
+  if (!cfg || states.has(guild.id)) return true;
+
+  let vc;
+  try {
+    vc = await guild.channels.fetch(cfg.channelId);
+  } catch (err) {
+    if (err.code !== 10003) return false; // error ชั่วคราว (เน็ต/Discord) ลองใหม่ทีหลัง
+    vc = null; // 10003 = ห้องถูกลบไปแล้ว
+  }
+  if (!vc || vc.type !== ChannelType.GuildVoice) {
+    console.warn(`[music] ห้อง 24/7 ของเซิร์ฟ ${guild.id} หายไปแล้ว ปิดโหมด 24/7 ให้`);
+    disable247(guild.id);
+    return true;
+  }
+  if (!vc.permissionsFor(guild.members.me)?.has([P.ViewChannel, P.Connect, P.Speak])) return false; // ยังไม่มีสิทธิ์ รอแอดมินแก้แล้วลองใหม่
+
+  const homeText = guild.channels.cache.get(consoleCfg(guild)?.channelId ?? cfg.textChannelId);
+  const g = createState(guild, vc, homeText?.isTextBased() ? homeText : null);
+  g.stay247 = true;
+  try {
+    await entersState(g.connection, VoiceConnectionStatus.Ready, 20_000);
+  } catch {
+    destroyState(g);
+    return false;
+  }
+  if (states.get(guild.id) !== g) return true;
+
+  const genre = GENRES.find((x) => x.key === cfg.genre);
+  if (genre) {
+    g.genre = { ...genre, by: guild.members.me?.id ?? guild.client.user.id };
+    g.genreSeen = new Set();
+  }
+  advance(g); // คิวว่าง = refill ตามแนว/สุ่มแนวให้เอง
+  return true;
+}
+
+// ตั้งเวลาเข้าห้อง 24/7 ใหม่ (ถ้าพลาดจะลองซ้ำโดยรอนานขึ้นเรื่อยๆ สูงสุด 5 นาที)
+function schedule247(guild, delay = 5_000) {
+  if (!db.music247?.[guild.id] || rejoinTimers.has(guild.id)) return;
+  const t = setTimeout(async () => {
+    rejoinTimers.delete(guild.id);
+    let ok = false;
+    try {
+      ok = await join247(guild);
+    } catch (err) {
+      console.error('เข้าห้อง 24/7 ไม่สำเร็จ:', err.message);
+    }
+    if (!ok) schedule247(guild, Math.min(delay * 2, RETRY_247_MAX_MS));
+  }, delay);
+  t.unref?.();
+  rejoinTimers.set(guild.id, t);
+}
+
+async function resume247(client) {
+  for (const guildId of Object.keys(db.music247 ?? {})) {
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) continue;
+    let ok = false;
+    try {
+      ok = await join247(guild);
+    } catch (err) {
+      console.error('กลับเข้าห้อง 24/7 ไม่สำเร็จ:', err.message);
+    }
+    if (!ok) schedule247(guild);
+  }
 }
 
 // ---------- คิว ----------
@@ -501,7 +643,13 @@ function advance(g, { skipped = false, failed = false } = {}) {
   if (!g.current) {
     // คิวหมด: โหมดแนวเพลง / autoplay ไปหาเพลงใหม่มาต่อ ถ้าหาไม่ได้ค่อยจบ
     const seed = prev && !failed ? prev : g.history.at(-1);
-    const refill = g.genre ? () => refillGenre(g) : g.autoplay && seed ? () => refillAutoplay(g, seed) : null;
+    const refill = g.genre
+      ? () => refillGenre(g)
+      : g.autoplay && seed
+        ? () => refillAutoplay(g, seed)
+        : g.stay247
+          ? () => refill247(g)
+          : null;
     if (!refill) return queueEnded(g);
     refill().then((ok) => {
       if (states.get(g.guildId) !== g || g.current) return;
@@ -536,6 +684,12 @@ function onIdle(g) {
       notify(g, `! เล่น **${clean(g.current.title)}** ไม่ได้${why ? `: ${why}` : ' (ลองอัปเดต yt-dlp ให้เป็นเวอร์ชันล่าสุด)'} ข้ามให้แล้ว`);
     }
   }
+  g.fails = failed ? g.fails + 1 : 0;
+  if (g.stay247 && g.fails >= FAIL_STREAK_247) {
+    // 24/7: เล่นไม่ได้ติดกันหลายเพลง (เช่น YouTube บล็อก/เน็ตหลุด) พักก่อนแล้วลองใหม่เอง กันวนรัวๆ
+    if (g.fails === FAIL_STREAK_247) notify(g, `! เล่นเพลงไม่ได้ติดกัน ${FAIL_STREAK_247} เพลง โหมด 24/7 จะพักแล้วลองใหม่ให้เอง`);
+    return queueEnded(g);
+  }
   advance(g, { skipped, failed });
 }
 
@@ -546,6 +700,22 @@ function queueEnded(g) {
   killProc(g);
   releaseCard(g);
   clearTimeout(g.idleTimer);
+  if (g.stay247) {
+    // 24/7: ไม่ออกจากห้อง รอสักพักแล้วหาเพลงมาเล่นต่อ
+    const delay = Math.min(RETRY_247_MS * Math.max(1, g.fails), RETRY_247_MAX_MS);
+    g.idleTimer = setTimeout(async () => {
+      if (states.get(g.guildId) !== g || g.current || !g.stay247) return;
+      const ok = g.queue.length > 0 || (await refill247(g));
+      if (states.get(g.guildId) !== g || g.current || !g.stay247) return;
+      if (ok) advance(g);
+      else {
+        g.fails++;
+        queueEnded(g);
+      }
+    }, delay);
+    g.idleTimer.unref?.();
+    return;
+  }
   g.idleTimer = setTimeout(() => {
     if (states.get(g.guildId) === g && !g.current) {
       notify(g, 'ไม่มีเพลงต่อแล้ว บอทขอออกจากห้องเสียงนะ');
@@ -593,38 +763,53 @@ function startTrack(g, track) {
 const EQ_CHARS = '▁▂▃▄▅▆▇█';
 const VOL_STEP = 10; // กดปุ่ม VOL −/+ ครั้งละกี่ %
 
-// อีควอไลเซอร์หลอกๆ ขยับทุกครั้งที่การ์ดถูกอัปเดต (เล่นอยู่=ขยับ, หยุด=ราบเรียบ)
-const eqLine = (playing) =>
-  Array.from({ length: 16 }, () => (playing ? EQ_CHARS[Math.floor(Math.random() * EQ_CHARS.length)] : EQ_CHARS[0])).join('');
-
-function progressLine(g) {
+// แดชบอร์ดแบบเทปคาสเซ็ต: ม้วนซ้ายค่อยๆ เล็กลง ม้วนขวาใหญ่ขึ้นตามความคืบหน้า แกนกลางสลับ + / x ทุกครั้งที่การ์ดอัปเดต (หยุดชั่วคราว = ■)
+const CASSETTE_W = 32; // กว้างพอดีมือถือ
+function cassetteDash(g, paused) {
   const t = g.current;
+  const W = CASSETTE_W;
   const pos = Math.floor((g.resource?.playbackDuration ?? 0) / 1000);
-  const len = 16;
-  if (!(t.duration > 0)) return `${fmt(pos)} ${'▰'.repeat(len - 1)}◉ LIVE`;
-  const head = Math.min(len - 1, Math.floor((Math.min(pos, t.duration) / t.duration) * len));
-  return `${fmt(Math.min(pos, t.duration))} ${'▰'.repeat(head)}◉${'▱'.repeat(len - 1 - head)} ${fmt(t.duration)}`;
-}
+  const live = !(t.duration > 0);
+  const p = live ? 0.5 : Math.min(1, pos / t.duration);
+  const hub = paused ? '■' : Math.floor(Date.now() / 1000) % 2 ? 'x' : '+';
+  const reel = (a, ch) => `(${ch.repeat(a)}${hub}${ch.repeat(a)})`;
+  const L = reel(Math.round(2 - 2 * p), '▓');
+  const R = reel(Math.round(2 * p), '▒');
 
-function volumeLine(g) {
+  const left = g.stay247 ? 'SIDE A · 24/7' : 'SIDE A';
+  const status = paused ? '❚❚ PAUSED' : '▸ PLAYING';
+  const head = ` ${left}${' '.repeat(W - 4 - left.length - status.length)}${status} `;
+  const window = ` ${L}${'─'.repeat(W - 8 - L.length - R.length)}${R} `;
+  const tape = [
+    `╭${'─'.repeat(W - 2)}╮`,
+    `│${head}│`,
+    `│ ╭${'─'.repeat(W - 6)}╮ │`,
+    `│ │${window}│ │`,
+    `│ ╰${'─'.repeat(W - 6)}╯ │`,
+    `│  ◦ ╲${'▁'.repeat(W - 12)}╱ ◦  │`,
+    `╰${'─'.repeat(W - 2)}╯`,
+  ];
+
+  const n = 14;
+  const h = Math.min(n - 1, Math.floor(p * n));
+  const progress = live ? `${fmt(pos)} ${'━'.repeat(n - 1)}◉ LIVE` : `${fmt(pos)} ${'━'.repeat(h)}◉${'─'.repeat(n - 1 - h)} ${fmt(t.duration)}`;
   const pct = Math.round(g.volume * 100);
   const filled = Math.round(g.volume * 10);
-  return `VOL ${'▮'.repeat(filled)}${'▯'.repeat(10 - filled)} ${String(pct).padStart(3)}%`;
+  return [
+    '```',
+    ...tape,
+    progress,
+    `VOL ${'▮'.repeat(filled)}${'▯'.repeat(10 - filled)} ${String(pct).padStart(3)}%`,
+    `LOOP ${g.loop.toUpperCase()} │ QUEUE ${g.queue.length}`,
+    '```',
+  ].join('\n');
 }
 
 function nowPlayingPayload(g) {
   const t = g.current;
   const paused = g.player.state.status === AudioPlayerStatus.Paused;
-  const pct = Math.round(g.volume * 100);
 
-  const dash = [
-    '```',
-    `${eqLine(!paused)}  ${paused ? '❚❚ PAUSED' : '▸ PLAYING'}`,
-    progressLine(g),
-    volumeLine(g),
-    `LOOP ${g.loop.toUpperCase().padEnd(5)} │ QUEUE ${g.queue.length}`,
-    '```',
-  ].join('\n');
+  const dash = cassetteDash(g, paused);
 
   const card = new ContainerBuilder().setAccentColor(paused ? 0x6b6b6b : 0xffffff);
   const head = [`### ◢◤ NOW PLAYING ◥◣`, `**${link(t)}**`, `-# ${t.author ? `${clean(t.author)} • ` : ''}${t.autoplay ? 'Autoplay • เริ่มโดย' : t.auto && g.genre ? `แนว ${g.genre.label} • เริ่มโดย` : 'ขอโดย'} <@${t.requestedBy}>`].join('\n');
@@ -641,16 +826,10 @@ function nowPlayingPayload(g) {
     .addSeparatorComponents(divider())
     .addTextDisplayComponents(text('### ▸ Quick Actions'))
     .addActionRowComponents(
-      new ActionRowBuilder().addComponents(
-        btn('pause', paused ? '▷ Resume' : '❚❚ Stop'),
-        btn('skip', '⏭ Skip'),
-        btn('add', '✚ Add Music'),
-        btn('search', '🔎︎ Search'),
-        btn('queue', '☰ Queue'),
-      ),
-      new ActionRowBuilder().addComponents(btn('fav', `${HEART} Favorite`), btn('hist', `${HOURGLASS} History`), btn('auto', `Auto: ${g.autoplay ? 'On' : 'Off'}`)),
-      new ActionRowBuilder().addComponents(btn('volmodal', '၊၊||၊ Volume'), btn('controls', 'Controls')),
-      
+      // ปุ่มที่มีไอคอนแสดงแค่ไอคอน เหลือข้อความเต็มเฉพาะ Auto กับ Controls
+      new ActionRowBuilder().addComponents(btn('pause', paused ? '▷' : '❚❚'), btn('skip', '⏭'), btn('add', '✚'), btn('search', '🔎︎'), btn('queue', '☰')),
+      new ActionRowBuilder().addComponents(btn('fav', HEART), btn('hist', HOURGLASS), btn('volmodal', '၊၊||၊'), btn('reset', '↺')),
+      new ActionRowBuilder().addComponents(btn('auto', `Auto: ${g.autoplay ? 'On' : 'Off'}`), btn('controls', 'Controls')),
     );
   return { components: [card], flags: V2, allowedMentions: NO_PING };
 }
@@ -799,7 +978,7 @@ async function ensureConsole(guild) {
 async function resetConsole(guild) {
   const msg = await ensureConsole(guild);
   if (!msg || states.get(guild.id)?.current) return; // มีเพลงเล่นอยู่ = ไม่ต้องรีเซ็ต
-  msg.edit(idleConsolePayload()).catch(() => {});
+  await msg.edit(idleConsolePayload()).catch(() => {});
 }
 
 // เลิกใช้การ์ดเพลงปัจจุบัน: ถ้าเป็นคอนโซลถาวรให้กลับเป็นหน้าว่าง ถ้าเป็นการ์ดธรรมดาให้ลบทิ้ง
@@ -908,7 +1087,33 @@ function guardControl(i) {
   return { g };
 }
 
-async function playQuery(i, query, { genre = null, ephemeral = false, preset = null } = {}) {
+const AUTO_DELETE_MS = 5000;
+
+// แก้ข้อความตอบกลับ แล้วลบทิ้งเองหลัง 5 วินาที (กันข้อความ "เพิ่มเพลงแล้ว" สะสมจนดันคอนโซลขึ้นไป)
+async function replyAutoDelete(i, payload, ms = AUTO_DELETE_MS) {
+  const msg = await i.editReply(payload);
+  setTimeout(() => i.deleteReply().catch(() => {}), ms);
+  return msg;
+}
+
+// หา track จากหลายบรรทัด (1 บรรทัด = 1 เพลง/ลิงก์/เพลย์ลิสต์) บรรทัดไหนหาไม่เจอจะข้ามไป
+async function resolveMany(queries, requestedBy) {
+  const results = await Promise.allSettled(queries.map((q) => resolveTracks(q, requestedBy)));
+  const tracks = [];
+  let failed = 0;
+  let firstErr;
+  for (const r of results) {
+    if (r.status === 'fulfilled' && r.value.length) tracks.push(...r.value);
+    else {
+      failed++;
+      if (r.status === 'rejected') firstErr ??= r.reason;
+    }
+  }
+  if (!tracks.length) throw firstErr ?? Object.assign(new Error('ไม่พบเพลงที่ค้นหา'), { friendly: true });
+  return { tracks, failed };
+}
+
+async function playQuery(i, query, { genre = null, ephemeral = false, preset = null, queries = null } = {}) {
   const vc = i.member?.voice?.channel;
   if (!vc) return i.reply({ content: '✕ เข้าห้องเสียงก่อนแล้วค่อยสั่งเล่นเพลงนะ', ...EPHEMERAL });
   if (vc.type !== ChannelType.GuildVoice) return i.reply({ content: '✕ เล่นเพลงได้เฉพาะห้องเสียงปกติ (ยังไม่รองรับ Stage)', ...EPHEMERAL });
@@ -918,6 +1123,10 @@ async function playQuery(i, query, { genre = null, ephemeral = false, preset = n
     return i.reply({ content: `✕ บอทกำลังเล่นเพลงอยู่ที่ห้อง <#${g.channelId}> เข้าห้องนั้นก่อน หรือรอให้เล่นจบนะ`, ...EPHEMERAL });
   }
   if (!g) {
+    const home = db.music247?.[i.guild.id];
+    if (home && home.channelId !== vc.id) {
+      return i.reply({ content: `✕ บอทเปิดโหมด 24/7 ประจำห้อง <#${home.channelId}> อยู่ เข้าห้องนั้น หรือให้แอดมินปิดด้วย /247 off ก่อนนะ`, ...EPHEMERAL });
+    }
     const me = i.guild.members.me;
     const perms = vc.permissionsFor(me);
     if (!perms?.has([P.ViewChannel, P.Connect, P.Speak])) {
@@ -932,26 +1141,33 @@ async function playQuery(i, query, { genre = null, ephemeral = false, preset = n
 
   const seen = new Set();
   let tracks;
+  let failedLines = 0;
   try {
-    tracks = preset ?? (genre ? await genreTracks(genre, i.user.id, seen) : await resolveTracks(query, i.user.id));
+    if (queries) {
+      const r = await resolveMany(queries, i.user.id);
+      tracks = r.tracks;
+      failedLines = r.failed;
+    } else {
+      tracks = preset ?? (genre ? await genreTracks(genre, i.user.id, seen) : await resolveTracks(query, i.user.id));
+    }
   } catch (err) {
-    if (err.friendly) return i.editReply(err.message);
-    if (err.code === 'ENOENT') return i.editReply(NOT_FOUND_MSG);
+    if (err.friendly) return replyAutoDelete(i, err.message);
+    if (err.code === 'ENOENT') return replyAutoDelete(i, NOT_FOUND_MSG);
     console.error('ค้นหาเพลงไม่สำเร็จ:', err.message);
-    return i.editReply(`ค้นหาเพลงไม่สำเร็จ: ${lastError(err.stderr, err.killed ? 'ใช้เวลานานเกินไป' : 'เกิดข้อผิดพลาด')}`);
+    return replyAutoDelete(i, `ค้นหาเพลงไม่สำเร็จ: ${lastError(err.stderr, err.killed ? 'ใช้เวลานานเกินไป' : 'เกิดข้อผิดพลาด')}`);
   }
-  if (!tracks.length) return i.editReply('ไม่พบเพลงที่ค้นหา ลองเปลี่ยนคำค้นหา หรือใช้ลิงก์ตรงๆ');
+  if (!tracks.length) return replyAutoDelete(i, 'ไม่พบเพลงที่ค้นหา ลองเปลี่ยนคำค้นหา หรือใช้ลิงก์ตรงๆ');
 
   // ระหว่างค้นหา สถานะอาจเปลี่ยน (เช่น มีคนอื่นสั่ง /play ก่อน หรือมีคน /stop)
   g = states.get(i.guild.id);
-  if (g && g.channelId !== vc.id) return i.editReply(`✕ บอทกำลังเล่นเพลงอยู่ที่ห้อง <#${g.channelId}> เข้าห้องนั้นก่อนนะ`);
+  if (g && g.channelId !== vc.id) return replyAutoDelete(i, `✕ บอทกำลังเล่นเพลงอยู่ที่ห้อง <#${g.channelId}> เข้าห้องนั้นก่อนนะ`);
   if (!g) {
     g = createState(i.guild, vc, textChannelFor(i));
     try {
       await entersState(g.connection, VoiceConnectionStatus.Ready, 20_000);
     } catch {
       destroyState(g);
-      return i.editReply('✕ บอทเข้าห้องเสียงไม่สำเร็จ ลองใหม่อีกครั้งนะ');
+      return replyAutoDelete(i, '✕ บอทเข้าห้องเสียงไม่สำเร็จ ลองใหม่อีกครั้งนะ');
     }
   }
   g.textChannel = textChannelFor(i);
@@ -960,10 +1176,15 @@ async function playQuery(i, query, { genre = null, ephemeral = false, preset = n
     g.queue = []; // เปลี่ยนแนว = เริ่มคิวใหม่ตามแนวนั้น
     g.genre = { ...genre, by: i.user.id };
     g.genreSeen = seen;
+    const home = g.stay247 && db.music247?.[g.guildId];
+    if (home) {
+      home.genre = genre.key; // 24/7: จำแนวล่าสุดไว้ใช้ตอนคิวหมดและตอนเปิดบอทใหม่
+      save();
+    }
   }
 
   const room = MAX_QUEUE - g.queue.length;
-  if (room <= 0) return i.editReply(`✕ คิวเต็มแล้ว (สูงสุด ${MAX_QUEUE} เพลง)`);
+  if (room <= 0) return replyAutoDelete(i, `✕ คิวเต็มแล้ว (สูงสุด ${MAX_QUEUE} เพลง)`);
   const added = tracks.slice(0, room);
   const wasIdle = !g.current;
   const position = g.queue.length + (g.current ? 1 : 0) + 1;
@@ -973,12 +1194,13 @@ async function playQuery(i, query, { genre = null, ephemeral = false, preset = n
 
   const first = added[0];
   if (genre) {
-    return i.editReply({ content: `เปิดแนว **${genre.label}** แล้ว บอทจะเล่นต่อให้เรื่อยๆ (ปิดโหมดได้จากเมนูแนวเพลง หรือสั่ง /stop)`, allowedMentions: NO_PING });
+    return replyAutoDelete(i, { content: `เปิดแนว **${genre.label}** แล้ว บอทจะเล่นต่อให้เรื่อยๆ (ปิดโหมดได้จากเมนูแนวเพลง หรือสั่ง /stop)`, allowedMentions: NO_PING });
   }
   if (added.length > 1) {
-    return i.editReply({ content: `เพิ่ม **${added.length}** เพลงเข้าคิวแล้ว${added.length < tracks.length ? ' (คิวเต็มจึงเพิ่มได้เท่านี้)' : ''}`, allowedMentions: NO_PING });
+    const notes = [added.length < tracks.length ? 'คิวเต็มจึงเพิ่มได้เท่านี้' : '', failedLines ? `หาไม่เจอ ${failedLines} บรรทัด` : ''].filter(Boolean);
+    return replyAutoDelete(i, { content: `เพิ่ม **${added.length}** เพลงเข้าคิวแล้ว${notes.length ? ` (${notes.join(' • ')})` : ''}`, allowedMentions: NO_PING });
   }
-  return i.editReply({
+  return replyAutoDelete(i, {
     content: wasIdle ? `เริ่มเล่น **${clean(first.title)}**` : `+ เพิ่ม **${clean(first.title)}** เข้าคิวแล้ว (ลำดับที่ ${position} • ${fmt(first.duration)})`,
     allowedMentions: NO_PING,
   });
@@ -1107,14 +1329,16 @@ const commandHandlers = {
   }),
 
   stop: control((i, g) => {
-    destroyState(g);
-    return i.reply('หยุดเล่น ล้างคิว และออกจากห้องเสียงแล้ว');
+    const was247 = leaveByUser(g);
+    return i.reply(`หยุดเล่น ล้างคิว และออกจากห้องเสียงแล้ว${was247 ? ' (ปิดโหมด 24/7 ให้ด้วย เปิดใหม่ได้ด้วย /247)' : ''}`);
   }),
 
   leave: control((i, g) => {
-    destroyState(g);
-    return i.reply('บอทออกจากห้องเสียงแล้ว');
+    const was247 = leaveByUser(g);
+    return i.reply(`บอทออกจากห้องเสียงแล้ว${was247 ? ' (ปิดโหมด 24/7 ให้ด้วย เปิดใหม่ได้ด้วย /247)' : ''}`);
   }),
+
+  '247': cmd247,
 
   queue: control((i, g) => i.reply(queuePayload(g))),
 
@@ -1188,9 +1412,78 @@ const commandHandlers = {
   }),
 };
 
+// /247 : เปิด/ปิดโหมดให้บอทอยู่ในห้องเสียงและเล่นเพลงต่อเนื่องตลอดทั้งวัน
+async function cmd247(i) {
+  const cfg = db.music247?.[i.guild.id];
+  const mode = i.options.getString('mode') ?? (cfg ? 'off' : 'on');
+
+  if (mode === 'off') {
+    if (!cfg) return i.reply({ content: 'โหมด 24/7 ยังไม่ได้เปิดอยู่', ...EPHEMERAL });
+    disable247(i.guild.id);
+    const g = states.get(i.guild.id);
+    if (g) {
+      checkAlone(g); // ไม่มีคนอยู่ในห้อง = เริ่มนับถอยหลังออกตามปกติ
+      if (!g.current) queueEnded(g);
+      refreshCard(g);
+    }
+    return i.reply({ content: 'ปิดโหมด 24/7 แล้ว บอทกลับไปทำงานแบบปกติ (คิวหมดหรือไม่มีคนอยู่ในห้องก็จะออกเอง)', ...EPHEMERAL });
+  }
+
+  const vc = i.options.getChannel('channel') ?? i.member?.voice?.channel;
+  if (!vc) return i.reply({ content: '✕ เข้าห้องเสียงก่อน หรือเลือกห้องจากตัวเลือก channel ตอนสั่ง /247', ...EPHEMERAL });
+  if (vc.type !== ChannelType.GuildVoice) return i.reply({ content: '✕ โหมด 24/7 ใช้ได้เฉพาะห้องเสียงปกติ (ยังไม่รองรับ Stage)', ...EPHEMERAL });
+
+  let g = states.get(i.guild.id);
+  if (g && g.channelId !== vc.id) {
+    return i.reply({ content: `✕ บอทกำลังอยู่ที่ห้อง <#${g.channelId}> ใช้ /247 ในห้องนั้น หรือสั่ง /leave ก่อนนะ`, ...EPHEMERAL });
+  }
+  if (!g) {
+    const perms = vc.permissionsFor(i.guild.members.me);
+    if (!perms?.has([P.ViewChannel, P.Connect, P.Speak])) {
+      return i.reply({ content: `✕ บอทไม่มีสิทธิ์เข้าหรือพูดในห้อง <#${vc.id}> (ต้องมี View Channel, Connect, Speak)`, ...EPHEMERAL });
+    }
+  }
+
+  const genreKey = i.options.getString('genre');
+  const genre = genreKey ? GENRES.find((x) => x.key === genreKey) : null;
+
+  await i.deferReply(EPHEMERAL);
+  const text = textChannelFor(i);
+  db.music247 ??= {};
+  db.music247[i.guild.id] = { channelId: vc.id, textChannelId: text?.id ?? null, genre: genre?.key ?? g?.genre?.key ?? null };
+  save();
+
+  if (!g) {
+    g = createState(i.guild, vc, text);
+    try {
+      await entersState(g.connection, VoiceConnectionStatus.Ready, 20_000);
+    } catch {
+      destroyState(g);
+      disable247(i.guild.id);
+      return i.editReply('✕ บอทเข้าห้องเสียงไม่สำเร็จ ลองใหม่อีกครั้งนะ');
+    }
+  }
+  g.stay247 = true;
+  g.textChannel = text;
+  clearTimeout(g.aloneTimer);
+  g.aloneTimer = null;
+  clearTimeout(g.idleTimer);
+  if (genre) {
+    g.genre = { ...genre, by: i.user.id };
+    g.genreSeen = new Set();
+  }
+  if (!g.current) advance(g); // ยังไม่มีเพลง = เริ่มเล่นตามแนว/สุ่มแนวเลย
+  else refreshCard(g);
+
+  return i.editReply(
+    `เปิดโหมด **24/7** แล้ว บอทจะประจำอยู่ที่ <#${vc.id}> เล่นเพลงต่อเนื่องแม้ไม่มีใครอยู่ในห้อง และกลับเข้าห้องให้เองถ้าหลุดหรือเปิดบอทใหม่\n` +
+      `-# แนวเพลง: ${g.genre ? g.genre.label : 'สุ่มเมื่อคิวหมด'} • เปลี่ยนแนวได้จากเมนูบนการ์ด • ปิดโหมดด้วย /247 mode:ปิด (/stop และ /leave จะปิด 24/7 ด้วย)`,
+  );
+}
+
 // ---------- ปุ่ม / เมนู / ฟอร์ม บนการ์ด ----------
-const modal = (id, title, label, placeholder, { max = 300, value } = {}) => {
-  const input = new TextInputBuilder().setCustomId('value').setLabel(label).setStyle(TextInputStyle.Short).setPlaceholder(placeholder).setRequired(true).setMaxLength(max);
+const modal = (id, title, label, placeholder, { max = 300, value, paragraph = false } = {}) => {
+  const input = new TextInputBuilder().setCustomId('value').setLabel(label).setStyle(paragraph ? TextInputStyle.Paragraph : TextInputStyle.Short).setPlaceholder(placeholder).setRequired(true).setMaxLength(max);
   if (value) input.setValue(value);
   return new ModalBuilder().setCustomId(`music:${id}`).setTitle(title).addComponents(new ActionRowBuilder().addComponents(input));
 };
@@ -1214,9 +1507,14 @@ async function pickGenre(i) {
   if (key === 'off') {
     const { g, error } = guardControl(i);
     if (error) return i.reply({ content: error, ...EPHEMERAL });
-    g.genre = null;
+    const hadGenre = !!g.genre;
+    stopGenreMode(g);
+    if (hadGenre) g.queue = []; // ปิดโหมดแนว = ล้างคิวที่ระบบเติมไว้ (เพลงที่กำลังเล่นยังเล่นต่อ)
     refreshCard(g);
-    return i.reply({ content: 'ปิดโหมดเล่นตามแนวแล้ว (เพลงที่เหลือในคิวยังเล่นต่อจนหมด)', ...EPHEMERAL });
+    return i.reply({
+      content: `ปิดโหมดเล่นตามแนวและล้างคิวแล้ว (เพลงที่กำลังเล่นยังเล่นต่อ)${g.stay247 ? ' • โหมด 24/7 ยังเปิดอยู่ พอเพลงนี้จบบอทจะสุ่มแนวมาเล่นต่อ' : ''}`,
+      ...EPHEMERAL,
+    });
   }
   const genre = GENRES.find((x) => x.key === key);
   if (!genre) return i.deferUpdate();
@@ -1281,7 +1579,7 @@ async function musicComponent(i) {
     if (err) return i.reply({ content: err, ...EPHEMERAL });
     return i.showModal(
       action === 'add'
-        ? modal('addmodal', 'Add Music', 'ชื่อเพลง หรือ ลิงก์', 'ชื่อเพลง / ลิงก์ YouTube, SoundCloud (เพลย์ลิสต์ได้)')
+        ? modal('addmodal', 'Add Music', 'ชื่อเพลง หรือ ลิงก์ (1 บรรทัด = 1 เพลง)', 'ชื่อเพลง / ลิงก์ YouTube, SoundCloud (ขึ้นบรรทัดใหม่ = เพิ่มอีกเพลง)', { max: 1500, paragraph: true })
         : modal('searchmodal', 'Search Music', 'ค้นหาเพลง', 'ชื่อเพลง หรือศิลปิน', { max: 200 }),
     );
   }
@@ -1330,6 +1628,12 @@ async function musicComponent(i) {
     case 'mute':
       setVolume(g, g.volume > 0 ? 0 : g.lastVolume);
       return done();
+    case 'reset': {
+      // ล้างคิวทั้งหมด + ปิดโหมดแนว กันระบบเติมเพลงกลับมาเอง (Auto ยังเปิด/ปิดตามเดิม) เพลงที่กำลังเล่นยังเล่นต่อ
+      stopGenreMode(g);
+      g.queue = [];
+      return done();
+    }
     case 'clear': {
       if (!g.queue.length) return i.reply({ content: '✕ ในคิวไม่มีเพลงให้ล้าง', ...EPHEMERAL });
       g.queue = [];
@@ -1347,11 +1651,9 @@ async function musicComponent(i) {
       skipTrack(g); // การ์ดนี้จะถูกแทนที่ด้วยการ์ดเพลงถัดไป
       return i.deferUpdate();
     case 'stop':
-      destroyState(g);
-      return closed('หยุดเล่น ล้างคิว และออกจากห้องเสียงแล้ว');
+      return closed(`หยุดเล่น ล้างคิว และออกจากห้องเสียงแล้ว${leaveByUser(g) ? ' (ปิดโหมด 24/7 ให้ด้วย)' : ''}`);
     case 'leave':
-      destroyState(g);
-      return closed('บอทออกจากห้องเสียงแล้ว');
+      return closed(`บอทออกจากห้องเสียงแล้ว${leaveByUser(g) ? ' (ปิดโหมด 24/7 ให้ด้วย)' : ''}`);
     case 'queue':
       return i.reply(queuePayload(g, true));
     case 'controls':
@@ -1373,7 +1675,11 @@ async function musicModal(i) {
   const value = i.fields.getTextInputValue('value').trim();
 
   try {
-    if (kind === 'addmodal') return await playQuery(i, value);
+    if (kind === 'addmodal') {
+      const lines = [...new Set(value.split(/\r?\n/).map((l) => l.trim()).filter(Boolean))].slice(0, 10);
+      if (lines.length > 1) return await playQuery(i, lines[0], { queries: lines });
+      return await playQuery(i, lines[0] ?? value);
+    }
 
     if (kind === 'volmodal') {
       const { g, error } = guardControl(i);
@@ -1420,6 +1726,12 @@ async function musicModal(i) {
 
 // ---------- ออกจากห้องเมื่อไม่มีคนอยู่ ----------
 function checkAlone(g) {
+  if (g.stay247) {
+    // โหมด 24/7: ไม่ออกจากห้องแม้ไม่มีใครอยู่
+    clearTimeout(g.aloneTimer);
+    g.aloneTimer = null;
+    return;
+  }
   const ch = g.guild.channels.cache.get(g.channelId);
   const humans = ch?.members?.filter((m) => !m.user.bot).size ?? 0;
   if (humans > 0) {
@@ -1430,7 +1742,7 @@ function checkAlone(g) {
   if (g.aloneTimer) return;
   g.aloneTimer = setTimeout(() => {
     g.aloneTimer = null;
-    if (states.get(g.guildId) !== g) return;
+    if (states.get(g.guildId) !== g || g.stay247) return;
     const room = g.guild.channels.cache.get(g.channelId);
     if ((room?.members?.filter((m) => !m.user.bot).size ?? 0) > 0) return;
     notify(g, 'ไม่มีใครอยู่ในห้องเสียงแล้ว บอทขอออกนะ');
@@ -1443,8 +1755,14 @@ function onVoiceState(oldState, newState) {
   const g = states.get(newState.guild.id);
   if (!g) return;
   if (newState.id === newState.guild.members.me?.id) {
-    if (newState.channelId) g.channelId = newState.channelId; // ถูกย้ายห้อง
-    else return; // หลุดออกจากห้อง ให้ connection จัดการเอง
+    if (newState.channelId) {
+      g.channelId = newState.channelId; // ถูกย้ายห้อง
+      const home = g.stay247 && db.music247?.[g.guildId];
+      if (home && home.channelId !== newState.channelId) {
+        home.channelId = newState.channelId; // 24/7: จำห้องใหม่ไว้ใช้ตอนเข้าห้องใหม่
+        save();
+      }
+    } else return; // หลุดออกจากห้อง ให้ connection จัดการเอง
   } else if (oldState.channelId !== g.channelId && newState.channelId !== g.channelId) {
     return;
   }
@@ -1458,15 +1776,21 @@ export function register(client) {
   client.on(Events.VoiceStateUpdate, onVoiceState);
   client.on(Events.InteractionCreate, musicModal);
   // เปิดบอทใหม่ = คอนโซลที่ค้างอยู่ให้กลับเป็นหน้าว่าง (ปุ่มเก่าจะใช้ไม่ได้แล้ว)
-  const resetAll = () => {
-    for (const guildId of Object.keys(db.musicConsole ?? {})) {
-      const guild = client.guilds.cache.get(guildId);
-      if (guild) resetConsole(guild);
-    }
+  // แล้วค่อยกลับเข้าห้อง 24/7 (รีเซ็ตคอนโซลให้เสร็จก่อน การ์ด Now Playing จะได้ไม่โดนทับด้วยหน้าว่าง)
+  const boot = async () => {
+    await Promise.all(
+      Object.keys(db.musicConsole ?? {}).map(async (guildId) => {
+        const guild = client.guilds.cache.get(guildId);
+        if (guild) await resetConsole(guild).catch(() => {});
+      }),
+    );
+    await resume247(client);
   };
-  if (client.isReady()) resetAll();
-  else client.once(Events.ClientReady, resetAll);
+  if (client.isReady()) boot();
+  else client.once(Events.ClientReady, boot);
   client.on(Events.GuildDelete, (guild) => {
+    if (!guild.available) return; // เซิร์ฟล่มชั่วคราว ไม่ใช่โดนเตะ
+    disable247(guild.id);
     const g = states.get(guild.id);
     if (g) destroyState(g);
   });
